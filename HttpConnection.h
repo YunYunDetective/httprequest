@@ -1,14 +1,15 @@
 #ifndef __HTTPCONNECTION_H_
 #define __HTTPCONNECTION_H_
 
+
 #include <windows.h>
 #include <tchar.h>
-#include <WinInet.h>
 #include <vector>
 #include <string>
 #include <map>
 
 #include "Base64.h"
+
 
 using namespace std;
 typedef basic_string<TCHAR> tstring;
@@ -18,12 +19,11 @@ typedef basic_string<TCHAR> tstring;
  */
 class HttpConnection
 {
-
 public:
 	// エラー状態
 	enum Error {
-		ERROR_NONE,  // エラーなし
-		ERROR_INET,  // ネットワークライブラリのエラー
+		ERROR_NONE,	 // エラーなし
+		ERROR_INET,	 // ネットワークライブラリのエラー
 		ERROR_CANCEL // キャンセルされた
 	};
 
@@ -36,14 +36,13 @@ public:
 	 */
 	typedef bool (*RequestCallback)(void *context, void *buffer, DWORD &size);
 
-
 	/**
 	 * リトライ用コールバック処理
 	 * @param context コンテキスト
 	 * @return 中断する場合は true を返す
 	 */
 	typedef void (*RetryCallback)(void *context);
-	
+
 	/**
 	 * レスポンス用コールバック処理
 	 * @param context コンテキスト
@@ -52,22 +51,20 @@ public:
 	 * @return 中断する場合は true を返す
 	 */
 	typedef bool (*ResponseCallback)(void *context, const void *buffer, DWORD size);
-	
+
 	/**
 	 * コンストラクタ
 	 * @param agentName エージェント名
 	 * @param checkCert 認証確認するかどうか
 	 */
-	HttpConnection(tstring agentName, bool checkCert=false) : agentName(agentName), checkCert(checkCert), contentLength(0), secure(false){
+	HttpConnection(tstring agentName, bool checkCert=false)
+		: agentName(agentName), checkCert(checkCert), contentLength(0), secure(false)
+	{
 		::InitializeCriticalSection(&cs);
-		hInet = NULL;
-		hConn = NULL;
-		hReq  = NULL;
 	}
 
 	// デストラクタ
-	~HttpConnection(void) {
-		clearParam();
+	virtual ~HttpConnection(void) {
 		::DeleteCriticalSection(&cs);
 	}
 
@@ -80,28 +77,31 @@ public:
 	}
 
 	// ハンドルをクリア
-	void closeHandle();
+	virtual void closeHandle() = 0;
 
-	// 送信パラメータをクリア(名前を変えただけで、実体は送信データクリア)
+	// 送信パラメータをクリア
 	void clearParam() {
 		closeHandle();
 		clearHeader();
 	}
 
 	// ----------------------------------------------------------------------------------------
-	
+
 	// HTTP ヘッダを追加する
 	void addHeader(const TCHAR *name, const TCHAR *value);
 
-	// 認証ヘッダをセットする(addHeader のユーティリティ)
+	// 認証ヘッダをセットする
 	void addBasicAuthHeader(const tstring &user, const tstring &passwd) {
 		tstring sendStr = user + _T(":") + passwd;
-		tstring value = _T("Basic") + base64encode(sendStr.c_str(), sendStr.length());
+		tstring value = _T("Basic ") + base64encode(sendStr.c_str(), sendStr.length());
 		addHeader(_T("Authorization"), value.c_str());
 	}
-	
+
 	// ----------------------------------------------------------------------------------------------------
-	
+	void parseContentType(const TCHAR *buf, size_t length, tstring &contentType, tstring &encoding);
+
+	// ----------------------------------------------------------------------------------------------------
+
 	/**
 	 * リクエスト開始
 	 * @param method アクセスメソッド
@@ -110,44 +110,44 @@ public:
 	 * @param passwd アクセスパスワード
 	 * @return 成功したら true
 	 */
-	bool open(const TCHAR *method,
-			  const TCHAR *url,
-			  const TCHAR *user = NULL,
-			  const TCHAR *passwd = NULL);
+	virtual bool open(const TCHAR *method,
+					  const TCHAR *url,
+					  const TCHAR *user = NULL,
+					  const TCHAR *passwd = NULL) = 0;
 
 	/**
 	 * リクエスト送信
-	 * @param callback 送信用コールバック
+	 * @param requestCallback 送信用コールバック
+	 * @param retryCallback リトライ用コールバック
 	 * @param context コールバック用コンテキスト
-	 * @return エラー
+	 * @return エラーコード
 	 */
-	int request(RequestCallback requestCallback=NULL, RetryCallback retryCalblack = NULL, void *context=NULL);
-
+	virtual int request(RequestCallback requestCallback=NULL,
+						RetryCallback retryCallback=NULL,
+						void *context=NULL) = 0;
 
 	/**
 	 * レスポンス取得前情報収集
 	 */
-	void queryInfo();
-	
+	virtual void queryInfo() = 0;
+
 	/**
 	 * レスポンス受信
 	 * @param callback 保存用コールバック
 	 * @param context コールバック用コンテキスト
-	 * @return エラー
+	 * @return エラーコード
 	 */
-	int response(ResponseCallback callback=NULL, void *context=NULL);
-	
+	virtual int response(ResponseCallback callback=NULL, void *context=NULL) = 0;
+
 	// ----------------------------------------------------------------------------------------------------
-	
+
 	// エラーメッセージの取得
 	const TCHAR *getErrorMessage() const {
 		return errorMessage.c_str();
 	}
-	
+
 	// 最後のリクエストが成功しているかどうか
-	bool isValid() const {
-		return hReq != NULL;
-	}
+	virtual bool isValid() const  = 0;
 
 	// HTTPステータスコードを取得
 	int getStatusCode() const {
@@ -158,7 +158,7 @@ public:
 	const TCHAR *getStatusText() const {
 		return statusText.c_str();
 	}
-	
+
 	// 取得されたコンテンツの長さ
 	DWORD getContentLength() const {
 		return contentLength;
@@ -174,11 +174,11 @@ public:
 		return encoding.c_str();
 	}
 
-	// コンテンツのエンコーディング情報
+	// リクエストのエンコーディング情報
 	const TCHAR *getRequestEncoding() const {
 		return requestEncoding.c_str();
 	}
-	
+
 	/**
 	 * レスポンスのヘッダ情報を取得
 	 */
@@ -206,35 +206,35 @@ public:
 		return false;
 	}
 
-	bool getCheckCert() const { return checkCert;	}
-	void setCheckCert(bool check)	{ checkCert = check;}
+	bool getCheckCert() const {
+		return checkCert;
+	}
+	void setCheckCert(bool check) {
+		checkCert = check;
+	}
 
-private:
+protected:
 	CRITICAL_SECTION cs;
 
 	// 基礎情報
 	tstring agentName; ///< ユーザエージェント名
 	bool checkCert;	   ///< 証明書確認ダイアログを出すか
-	bool secure;       ///< https 通信かどうか
+	bool secure;	   ///< https 通信かどうか
 
-	HINTERNET hInet; ///< インターネット接続
-	HINTERNET hConn; ///< コネクション
-	HINTERNET hReq;  ///< HTTPリクエスト
-	
 	// 送信用データ
-	vector<tstring> header;	///< HTTP ヘッダ
-	DWORD requestContentLength; ///< リクエストの Content-Length:
-	tstring requestContentType; ///< リクエストの Content-Type:
-	tstring requestEncoding;    ///< リクエストのエンコード指定
+	vector<tstring> header;		  ///< HTTP ヘッダ
+	DWORD requestContentLength;	  ///< リクエストの Content-Length
+	tstring requestContentType;	  ///< リクエストの Content-Type
+	tstring requestEncoding;	  ///< リクエストのエンコード指定
 
 	// 受信用データ
 	bool validContentLength;
-	DWORD contentLength;     ///< Content-Length:
-	tstring contentType;     ///< Content-Type: のtype部
-	tstring encoding;        ///< Content-TYpe: のエンコーディング部
+	DWORD contentLength;	  ///< Content-Length
+	tstring contentType;	  ///< Content-Type: のtype部
+	tstring encoding;		  ///< Content-Type: のエンコーディング部
 
-	DWORD statusCode;        ///< HTTP status code
-	tstring statusText;      ///< HTTP status text
+	DWORD statusCode;		  ///< HTTP status code
+	tstring statusText;		  ///< HTTP status text
 	map<tstring,tstring> responseHeaders; ///< レスポンスヘッダ
 	map<tstring,tstring>::const_iterator rhit; //< レスポンスヘッダ参照用イテレータ
 
@@ -242,4 +242,4 @@ private:
 	tstring errorMessage; ///< エラーメッセージ
 };
 
-#endif
+#endif	// __HTTPCONNECTION_BASE_H_#

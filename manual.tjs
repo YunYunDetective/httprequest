@@ -14,7 +14,7 @@ class HttpRequest {
 	 * @param agentName HTTP通信時のエージェント名
 	 * @throw InvalidObject 親ウインドウ指定が不正
 	 */
-	function HttpRequest(window, cert=true, agentName="KIRIKIRI");
+	function HttpRequest(window, cert=true, agentName="KIRIKIRI", api = HttpRequest.WININET);
 
 	/**
 	 * 指定したメソッドで指定URLにリクエストする
@@ -96,7 +96,12 @@ class HttpRequest {
 	const RECEIVING = 3;
 	// readyState 読み込み完了
 	const LOADED = 4;
-	
+
+	// APIとしてWinINetを使用する
+	const WININET = 0;
+	// APIとしてWinHttpを使用する
+	const WINHTTP = 1;
+
 	/**
 	 * 通信状態。読み込み専用
 	 * @return 現在の通信状態

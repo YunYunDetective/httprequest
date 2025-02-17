@@ -1,4 +1,5 @@
-#include "HttpConnection.h"
+#include "HttpConnectionWinINet.h"
+#include "HttpConnectionWinHttp.h"
 #include "ncbind.hpp"
 #include <vector>
 using namespace std;
@@ -40,18 +41,32 @@ public:
 		READYSTATE_LOADED
 	};
 
+	enum Api {
+		API_WININET,
+		API_WINHTTP,
+	};
+
 	/**
 	 * コンストラクタ
 	 * @param objthis 自己オブジェクト
 	 * @param window 親ウインドウ
 	 * @param cert HTTP通信時に証明書チェックを行う
 	 */
-	HttpRequest(iTJSDispatch2 *objthis, iTJSDispatch2 *window, bool cert, const tjs_char *agentName)
-		 : objthis(objthis), window(window), http(agentName, cert),
-		   threadHandle(NULL), canceled(false),
-		   outputStream(NULL), outputLength(0), inputStream(NULL), inputLength(0),
-		   readyState(READYSTATE_UNINITIALIZED), statusCode(0)
+	HttpRequest(iTJSDispatch2 *objthis, iTJSDispatch2 *window, bool cert, const tjs_char *agentName, int api)
+		: objthis(objthis), window(window), http(nullptr),
+		  threadHandle(NULL), canceled(false),
+		outputStream(NULL), outputLength(0), inputStream(NULL), inputLength(0),
+		readyState(READYSTATE_UNINITIALIZED), statusCode(0)
 	{
+		switch (api) {
+		default:
+		case API_WININET:
+			http = new HttpConnectionWinINet(agentName, cert);
+			break;
+		case API_WINHTTP:
+			http = new HttpConnectionWinHttp(agentName, cert);
+			break;
+		}
 		window->AddRef();
         if (sRefCount[window]++ == 0) {
           setReceiver(true);
@@ -63,6 +78,7 @@ public:
 	 */
 	~HttpRequest() {
 		abort();
+		delete http;
         if (--sRefCount[window] <= 0) {
           setReceiver(false);
           sRefCount.erase(window);
@@ -80,10 +96,10 @@ public:
 	 */
 	void _open(const tjs_char *method, const tjs_char *url, const tjs_char *userName, const tjs_char *password) {
 		abort();
-		if (http.open(method, url, userName, password)) {
+		if (http->open(method, url, userName, password)) {
 			onReadyStateChange(READYSTATE_OPEN);
 		} else {
-			TVPThrowExceptionMessage(http.getErrorMessage());
+			TVPThrowExceptionMessage(http->getErrorMessage());
 		}
 	}
 
@@ -102,7 +118,7 @@ public:
 	 */
 	void setRequestHeader(const tjs_char *name, const tjs_char *value) {
 		checkRunning();
-		http.addHeader(name, value);
+		http->addHeader(name, value);
 	}
 
 	/**
@@ -125,7 +141,7 @@ public:
 			case tvtString:
 				{
 					tTJSVariantString *str = data->AsStringNoAddRef();
-					int enc = getEncoding(http.getRequestEncoding());
+					int enc = getEncoding(http->getRequestEncoding());
 					inputLength = ::getWCToMBLen(enc, *str, str->GetLength());
 					inputData.resize(inputLength);
 					if (inputLength) {
@@ -159,7 +175,7 @@ public:
 		if (inputLength > 0) {
             tTJSVariant val = tjs_int64(inputLength);
             ttstr len(val);
-			http.addHeader(_T("Content-Length"), len.c_str());
+			http->addHeader(_T("Content-Length"), len.c_str());
 		}
 	    if (async) {
 		    startThread();
@@ -252,8 +268,8 @@ public:
 		iTJSDispatch2 *dict = TJSCreateDictionaryObject();
 		tstring name;
 		tstring value;
-		http.initRH();
-		while (http.getNextRH(name, value)) {
+		http->initRH();
+		while (http->getNextRH(name, value)) {
 			tTJSVariant v(value.c_str());
 			dict->PropSet(TJS_MEMBERENSURE, name.c_str(), NULL, &v, dict);
 		}
@@ -268,7 +284,7 @@ public:
 	 * @return ヘッダの値
 	 */
 	const tjs_char *getResponseHeader(const tjs_char *name) {
-		return http.getResponseHeader(name);
+		return http->getResponseHeader(name);
 	}
 
 	/**
@@ -291,7 +307,7 @@ public:
 	tTJSString _getResponseText(const tjs_char *encoding) {
 		tTJSString ret;
 		if (encoding == NULL) {
-			encoding = http.getEncoding();
+			encoding = http->getEncoding();
 		}
 		if (outputData.size() > 0) {
 			DWORD size = outputData.size();
@@ -319,9 +335,9 @@ public:
 	 * @return レスポンスデータ
 	 */
 	tTJSVariant getResponse() {
-		const TCHAR *contentType = http.getContentType();
-		if (_tcsncmp(http.getContentType(), _T("text/"), 5) == 0) {
-			return _getResponseText(http.getEncoding());
+		const TCHAR *contentType = http->getContentType();
+		if (_tcsncmp(http->getContentType(), _T("text/"), 5) == 0) {
+			return _getResponseText(http->getEncoding());
 //		} else if (_tcscmp(contentType, CTYPE_URLENCODED) == 0) {
 //			// URLENCODEDなデータを解析して辞書を構築
 		} else if (outputData.size() > 0) {
@@ -358,15 +374,15 @@ public:
 	}
 
 	const tjs_char *getContentType() {
-		return http.getContentType();
+		return http->getContentType();
 	}
 
 	const tjs_char *getContentTypeEncoding() {
-		return http.getEncoding();
+		return http->getEncoding();
 	}
 
 	DWORD getContentLength() {
-		return http.getContentLength();
+		return http->getContentLength();
 	}
 	
 	/**
@@ -380,7 +396,10 @@ public:
 		if (window->IsInstanceOf(0, NULL, NULL, L"Window", window) != TJS_S_TRUE) {
 			TVPThrowExceptionMessage(L"InvalidObject");
 		}
-		*result = new HttpRequest(objthis, window, numparams >= 2 ? params[1]->AsInteger() != 0 : true, AGENT_NAME);
+		bool cert = numparams >= 2 ? params[1]->AsInteger() != 0 : true;
+		ttstr agentName = numparams >= 3 ? *params[2] : AGENT_NAME;
+		int api = numparams >= 4 ? params[3]->AsInteger() : API_WININET;
+		*result = new HttpRequest(objthis, window, cert, agentName.c_str(), api);
 		return S_OK;
 	}
 	
@@ -394,7 +413,7 @@ protected:
 	}
 
 	void checkOpen() {
-		if (!http.isValid()) {
+		if (!http->isValid()) {
 			TVPThrowExceptionMessage(TJS_W("not open"));
 		}
 	}
@@ -599,17 +618,17 @@ protected:
 			errorCode = HttpConnection::ERROR_CANCEL;
 			clearInput();
 		} else {
-		    if ((errorCode = http.request(async ? uploadCallback : uploadCallbackSync, rewindUploadCallback, (void*)this)) == HttpConnection::ERROR_NONE) {
+		    if ((errorCode = http->request(async ? uploadCallback : uploadCallbackSync, rewindUploadCallback, (void*)this)) == HttpConnection::ERROR_NONE) {
 				clearInput();
 				if (canceled) {
 					errorCode = HttpConnection::ERROR_CANCEL;
 					clearOutput();
 				} else {
-					http.queryInfo();
+					http->queryInfo();
 					outputSize = 0;
-					outputLength = http.getContentLength();
+					outputLength = http->getContentLength();
 					if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)this, (LPARAM)READYSTATE_RECEIVING);
-				    if ((errorCode = http.response(async ? downloadCallback : downloadCallbackSync, (void*)this)) == HttpConnection::ERROR_NONE) {
+				    if ((errorCode = http->response(async ? downloadCallback : downloadCallbackSync, (void*)this)) == HttpConnection::ERROR_NONE) {
 						closeOutput();
 					} else {
 						clearOutput();
@@ -621,8 +640,8 @@ protected:
 		}
 		switch (errorCode) {
 		case HttpConnection::ERROR_NONE:
-			statusCode = http.getStatusCode();
-			statusText = http.getStatusText();
+			statusCode = http->getStatusCode();
+			statusText = http->getStatusText();
 			break;
 		case HttpConnection::ERROR_CANCEL:
 			statusCode = -1;
@@ -630,7 +649,7 @@ protected:
 			break;
 		default:
 			statusCode = 0;
-			statusText = http.getErrorMessage();
+			statusText = http->getErrorMessage();
 			break;
 		}
 		if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)this, (LPARAM)READYSTATE_LOADED);
@@ -659,14 +678,14 @@ protected:
 			threadHandle = 0;
 		}
 	}
-	
+
 private:
 	iTJSDispatch2 *objthis; ///< 自己オブジェクト情報の参照
 	iTJSDispatch2 *window; ///< ウインドウオブジェクト情報の参照(イベント取得に必要)
 	HWND hwnd; ///< ウインドウハンドラ。メインスレッド停止中に Window にアクセスすると固まるので処理前にとっておく
-	
+
 	// HTTP通信処理用
-	HttpConnection http;
+	HttpConnection *http;
 
 	// スレッド処理用
 	HANDLE threadHandle; ///< スレッドのハンドル
@@ -698,6 +717,8 @@ NCB_REGISTER_CLASS(HttpRequest) {
 	ENUM(SENT);
 	ENUM(RECEIVING);
 	ENUM(LOADED);
+	Variant("WININET", (int)HttpRequest::API_WININET);
+	Variant("WINHTTP", (int)HttpRequest::API_WINHTTP);
 	RawCallback(TJS_W("open"), &Class::open, 0);
 	NCB_METHOD(setRequestHeader);
 	RawCallback(TJS_W("send"), &Class::send, 0);
