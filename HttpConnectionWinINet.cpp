@@ -413,8 +413,8 @@ HttpConnectionWinINet::response(ResponseCallback callback, void *context)
 		return ERROR_INET;
 	}
 
-	// HTTP が OK を返した場合のみファイルセーブを enable にする
-	if (statusCode == HTTP_STATUS_OK && callback) {
+	// HTTPステータスに関係なく、サーバが返した本文は呼び出し側へ渡す
+	if (callback) {
 
 		// HTMLをパースして Content-Type からエンコーディングを取得する必要がある
 		bool needParseHtml = _tcsicmp(contentType.c_str(), _T("text/html")) == 0 && encoding.empty();
@@ -422,7 +422,16 @@ HttpConnectionWinINet::response(ResponseCallback callback, void *context)
 		DWORD size = 0;
 		DWORD len;
 		BYTE work[BUFSIZE];
-		while (InternetReadFile(hReq, (void*)work, sizeof work, &len) && len > 0) {
+		while (true) {
+			len = 0;
+			if (!InternetReadFile(hReq, (void*)work, sizeof work, &len)) {
+				storeErrorMessage(GetLastError(), errorMessage);
+				closeHandle();
+				return ERROR_INET;
+			}
+			if (len == 0) {
+				break;
+			}
 			size += len;
 			if (needParseHtml) {
 				// 取得したファイル中から METAタグを参照して Content-Type を再取得
