@@ -23,61 +23,60 @@ closeDetachedHandle(HINTERNET &handle)
 // クラス外で利用するヘルパー等がある場合はここに追加
 //////////////////////////////////////////////////////////////////////////
 
-/**
- * URL をホスト名 / ポート / パスに分解する簡易ヘルパー
- * (必要に応じて、さらに細かいエラー処理やURLのバリデーションなどを実装してください)
- */
 static bool parseUrl(const tstring &url,
 					 tstring &host,
 					 INTERNET_PORT &port,
 					 tstring &path,
-					 bool &secure)
+					 bool &secure,
+					 tstring &user,
+					 tstring &passwd)
 {
-	// 初期化
-	secure = false;
-	port = 80;
+	URL_COMPONENTS uc;
+	ZeroMemory(&uc, sizeof uc);
+	uc.dwStructSize = sizeof uc;
+	uc.dwSchemeLength   = 1;
+	uc.dwHostNameLength = 1;
+	uc.dwUserNameLength = 1;
+	uc.dwPasswordLength = 1;
+	uc.dwUrlPathLength  = 1;
+	uc.dwExtraInfoLength = 1;
+
+	if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
+		return false;
+	}
+
+	if (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) {
+		return false;
+	}
+
+	secure = uc.nScheme == INTERNET_SCHEME_HTTPS;
+	port = uc.nPort;
 	host.clear();
 	path.clear();
+	user.clear();
+	passwd.clear();
 
-	// プロトコル部分を判定 (http or https)
-	tstring::size_type pos = url.find(_T("://"));
-	if (pos == tstring::npos) {
-		return false; // URL形式が不正
+	if (uc.lpszHostName && uc.dwHostNameLength > 0) {
+		host = tstring(uc.lpszHostName, uc.dwHostNameLength);
+	}
+	if (host.empty()) {
+		return false;
 	}
 
-	tstring protocol = url.substr(0, pos);
-	secure = (_tcsicmp(protocol.c_str(), _T("https")) == 0);
-
-	// ホスト名以降を抽出
-	tstring remainder = url.substr(pos + 3);
-
-	// パスの開始位置
-	tstring::size_type slashPos = remainder.find(_T("/"));
-	if (slashPos == tstring::npos) {
-		// / が無い場合は全体がホスト名
-		host = remainder;
+	if (uc.lpszUrlPath && uc.dwUrlPathLength > 0) {
+		path = tstring(uc.lpszUrlPath, uc.dwUrlPathLength);
+	}
+	if (path.empty()) {
 		path = _T("/");
-	} else {
-		host = remainder.substr(0, slashPos);
-		path = remainder.substr(slashPos);
 	}
-
-	// ポート番号が指定されているかチェック(例: www.example.com:8080)
-	tstring::size_type colonPos = host.find(_T(":"));
-	if (colonPos != tstring::npos) {
-		// コロン以降をポートとして解析
-		tstring portStr = host.substr(colonPos + 1);
-		host = host.substr(0, colonPos);
-
-		INTERNET_PORT tmpPort = (INTERNET_PORT)_tstoi(portStr.c_str());
-		if (tmpPort > 0) {
-			port = tmpPort;
-		}
-	} else {
-		// ポート未指定の場合、https なら 443 にしておく
-		if (secure) {
-			port = 443;
-		}
+	if (uc.lpszExtraInfo && uc.dwExtraInfoLength > 0) {
+		path += tstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+	}
+	if (uc.lpszUserName && uc.dwUserNameLength > 0) {
+		user = tstring(uc.lpszUserName, uc.dwUserNameLength);
+	}
+	if (uc.lpszPassword && uc.dwPasswordLength > 0) {
+		passwd = tstring(uc.lpszPassword, uc.dwPasswordLength);
 	}
 
 	return true;
@@ -113,9 +112,9 @@ bool HttpConnectionWinHttp::open(const TCHAR *method,
 	errorMessage.clear();
 
 	// URL分解
-	tstring hostName, urlPath;
+	tstring hostName, urlPath, urlUser, urlPasswd;
 	INTERNET_PORT port;
-	bool result = parseUrl(url, hostName, port, urlPath, secure);
+	bool result = parseUrl(url, hostName, port, urlPath, secure, urlUser, urlPasswd);
 	if (!result) {
 		errorMessage = _T("Invalid URL");
 		::LeaveCriticalSection(&cs);
@@ -177,10 +176,24 @@ bool HttpConnectionWinHttp::open(const TCHAR *method,
 	// 認証を行う場合 (Basic 認証など) が必要なら、WinHttpSetCredentials を呼ぶ方法もあるが、
 	// addBasicAuthHeader() などで Authorization ヘッダを追加する実装と両立させる場合は注意。
 	// ここでは従来のヘッダ追加スタイルを維持するために、特に実装はしません。
+	tstring authUser;
 	if (user && user[0] != _T('\0')) {
+		authUser = user;
+	}
+	if (!urlUser.empty()) {
+		authUser = urlUser;
+	}
+	tstring authPasswd;
+	if (passwd) {
+		authPasswd = passwd;
+	}
+	if (!urlPasswd.empty()) {
+		authPasswd = urlPasswd;
+	}
+	if (!authUser.empty()) {
 		// Basic認証用のヘッダを生成
 		// 例: "Authorization: Basic <Base64>"
-		addBasicAuthHeader(user, (passwd ? passwd : _T("")));
+		addBasicAuthHeader(authUser, authPasswd);
 	}
 
 	::LeaveCriticalSection(&cs);
