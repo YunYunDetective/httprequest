@@ -3,6 +3,22 @@
 // WinHttp ライブラリをリンク
 #pragma comment(lib, "winhttp.lib")
 
+static HINTERNET
+detachHandle(HINTERNET &handle)
+{
+	return (HINTERNET)::InterlockedExchangePointer(
+		reinterpret_cast<PVOID volatile *>(&handle), NULL);
+}
+
+static void
+closeDetachedHandle(HINTERNET &handle)
+{
+	HINTERNET detached = detachHandle(handle);
+	if (detached) {
+		WinHttpCloseHandle(detached);
+	}
+}
+
 //////////////////////////////////////////////////////////////////////////
 // クラス外で利用するヘルパー等がある場合はここに追加
 //////////////////////////////////////////////////////////////////////////
@@ -75,19 +91,15 @@ static bool parseUrl(const tstring &url,
 void HttpConnectionWinHttp::closeHandle()
 {
 	::EnterCriticalSection(&cs);
-	if (hRequest) {
-		WinHttpCloseHandle(hRequest);
-		hRequest = NULL;
-	}
-	if (hConnect) {
-		WinHttpCloseHandle(hConnect);
-		hConnect = NULL;
-	}
-	if (hSession) {
-		WinHttpCloseHandle(hSession);
-		hSession = NULL;
-	}
+	closeDetachedHandle(hRequest);
+	closeDetachedHandle(hConnect);
+	closeDetachedHandle(hSession);
 	::LeaveCriticalSection(&cs);
+}
+
+void HttpConnectionWinHttp::abortRequest()
+{
+	closeDetachedHandle(hRequest);
 }
 
 
@@ -219,8 +231,7 @@ int HttpConnectionWinHttp::request(RequestCallback requestCallback,
 			bool isCancel = ! requestCallback(context, buffer, size);
 			if (isCancel) {
 				// ユーザ都合でキャンセル
-				WinHttpCloseHandle(hRequest);
-				hRequest = NULL;
+				closeDetachedHandle(hRequest);
 				::LeaveCriticalSection(&cs);
 				return ERROR_CANCEL;
 			}

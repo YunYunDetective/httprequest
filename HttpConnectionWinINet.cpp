@@ -18,6 +18,22 @@ private:
 
 #define BUFSIZE (1024*16)
 
+static HINTERNET
+detachHandle(HINTERNET &handle)
+{
+	return (HINTERNET)::InterlockedExchangePointer(
+		reinterpret_cast<PVOID volatile *>(&handle), NULL);
+}
+
+static void
+closeDetachedHandle(HINTERNET &handle)
+{
+	HINTERNET detached = detachHandle(handle);
+	if (detached) {
+		InternetCloseHandle(detached);
+	}
+}
+
 // データ中から METAタグで Content-Type を取得する
 // ※正規表現を想定してるのに注意
 extern bool matchContentType(tstring &text, tstring &result);
@@ -56,9 +72,15 @@ void
 HttpConnectionWinINet::closeHandle()
 {
 	LOCK;
-	if (hReq) { InternetCloseHandle(hReq);hReq=NULL; }
-	if (hConn) { InternetCloseHandle(hConn);hConn=NULL; }
-	if (hInet) { InternetCloseHandle(hInet);hInet=NULL; }
+	closeDetachedHandle(hReq);
+	closeDetachedHandle(hConn);
+	closeDetachedHandle(hInet);
+}
+
+void
+HttpConnectionWinINet::abortRequest()
+{
+	closeDetachedHandle(hReq);
 }
 
 /**

@@ -30,6 +30,8 @@ public:
 	// ハンドルをクリア
 	virtual void closeHandle();
 
+	virtual void abortRequest();
+
 	virtual bool open(const TCHAR *method,
 					  const TCHAR *url,
 					  const TCHAR *user = NULL,

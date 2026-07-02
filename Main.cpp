@@ -673,6 +673,7 @@ protected:
 	void stopThread() {
 		if (threadHandle) {
 			canceled = true;
+			http->abortRequest();
 			WaitForSingleObject(threadHandle, INFINITE);
 			CloseHandle(threadHandle);
 			threadHandle = 0;

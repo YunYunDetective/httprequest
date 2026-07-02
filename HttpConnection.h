@@ -79,6 +79,9 @@ public:
 	// ハンドルをクリア
 	virtual void closeHandle() = 0;
 
+	// 実行中のブロッキング I/O を中断する
+	virtual void abortRequest() = 0;
+
 	// 送信パラメータをクリア
 	void clearParam() {
 		closeHandle();
