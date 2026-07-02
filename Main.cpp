@@ -24,7 +24,10 @@ extern UINT getMBToWCLen(int enc, const char *mb, UINT mblen);
 extern void convMBToWC(int enc, const char *mb, UINT *mblen, wchar_t *wc, UINT *wclen);
 
 // カウンタ
+class HttpRequest;
 static std::map<iTJSDispatch2 *, int> sRefCount;
+static std::map<UINT_PTR, HttpRequest *> sRequestMap;
+static UINT_PTR sNextRequestId = 0;
 
 /**
  * HttpRequest クラス
@@ -56,7 +59,8 @@ public:
 		: objthis(objthis), window(window), http(nullptr),
 		  threadHandle(NULL), canceled(false),
 		outputStream(NULL), outputLength(0), inputStream(NULL), inputLength(0),
-		readyState(READYSTATE_UNINITIALIZED), statusCode(0)
+		readyState(READYSTATE_UNINITIALIZED), statusCode(0),
+		requestId(++sNextRequestId)
 	{
 		switch (api) {
 		default:
@@ -71,12 +75,14 @@ public:
         if (sRefCount[window]++ == 0) {
           setReceiver(true);
         }
+		sRequestMap[requestId] = this;
 	}
 	
 	/**
 	 * デストラクタ
 	 */
 	~HttpRequest() {
+		sRequestMap.erase(requestId);
 		abort();
 		delete http;
         if (--sRefCount[window] <= 0) {
@@ -460,17 +466,29 @@ protected:
 	 * イベント受信処理
 	 */
 	static bool __stdcall receiver(void *userdata, tTVPWindowMessage *Message) {
-        HttpRequest *self = (HttpRequest*)Message->WParam;
 		switch (Message->Msg) {
 		case WM_HTTP_READYSTATE:
+		  {
+          HttpRequest *self = findRequest((UINT_PTR)Message->WParam);
+          if (!self) return true;
           self->onReadyStateChange((ReadyState)Message->LParam);
           return true;
+		  }
 		case WM_HTTP_PROGRESS:
+		  {
+          HttpRequest *self = findRequest((UINT_PTR)Message->WParam);
+          if (!self) return true;
           int lparam = (int)Message->LParam;
           self->onProgress((lparam & 0x8000)!=0, tjs_real(lparam & 0x7fff) / 100.0);
           return true;
+		  }
 		}
 		return false;
+	}
+
+	static HttpRequest *findRequest(UINT_PTR requestId) {
+		std::map<UINT_PTR, HttpRequest *>::const_iterator it = sRequestMap.find(requestId);
+		return it != sRequestMap.end() ? it->second : NULL;
 	}
 
 	// -----------------------------------------------
@@ -521,7 +539,7 @@ protected:
 			inputSize += size;
 		    if (async) {
 			  int bp = (inputLength > 0) ? (DWORDLONG)inputSize * 10000 / inputLength : 0;
-			  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)this, 0x8000 | bp);
+			  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)requestId, 0x8000 | bp);
 			}
 		}
 		return !canceled;
@@ -576,7 +594,7 @@ protected:
 		outputSize += size;
 	    if (async) {
 		  int bp = (outputLength > 0) ? (DWORDLONG)outputSize * 10000 / outputLength : 0;
-		  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)this, bp);
+		  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)requestId, bp);
 		}
 		return !canceled;
 	}
@@ -611,7 +629,7 @@ protected:
 			hwnd = reinterpret_cast<HWND>((tjs_int64)(val));
 		}
 
-	    if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)this, (LPARAM)READYSTATE_SENT);
+	    if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_SENT);
 		inputSize = 0;
 		int errorCode;
 		if (canceled) {
@@ -627,7 +645,7 @@ protected:
 					http->queryInfo();
 					outputSize = 0;
 					outputLength = http->getContentLength();
-					if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)this, (LPARAM)READYSTATE_RECEIVING);
+					if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_RECEIVING);
 				    if ((errorCode = http->response(async ? downloadCallback : downloadCallbackSync, (void*)this)) == HttpConnection::ERROR_NONE) {
 						closeOutput();
 					} else {
@@ -652,7 +670,7 @@ protected:
 			statusText = http->getErrorMessage();
 			break;
 		}
-		if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)this, (LPARAM)READYSTATE_LOADED);
+		if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_LOADED);
 	}
 
 	// 実行スレッド
@@ -707,6 +725,7 @@ private:
 	int readyState;
 	int statusCode; ///< HTTPステータスコード
 	ttstr statusText; ///< HTTPステータステキスト
+	UINT_PTR requestId; ///< 非同期メッセージで参照する生存確認用ID
 };
 
 #define ENUM(n) Variant(#n, (int)HttpRequest::READYSTATE_ ## n)
