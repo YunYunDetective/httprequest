@@ -4,6 +4,7 @@
 #include <vector>
 using namespace std;
 #include <process.h>
+#include <atomic>
 
 // メッセージコード
 #define	WM_HTTP_READYSTATE	(WM_APP+6)	// ステート変更
@@ -57,7 +58,7 @@ public:
 	 */
 	HttpRequest(iTJSDispatch2 *objthis, iTJSDispatch2 *window, bool cert, const tjs_char *agentName, int api)
 		: objthis(objthis), window(window), http(nullptr),
-		  threadHandle(NULL), canceled(false),
+		  threadHandle(NULL), canceled(false), completionTimer(0),
 		outputStream(NULL), outputLength(0), inputStream(NULL), inputLength(0),
 		readyState(READYSTATE_UNINITIALIZED), statusCode(0),
 		requestId(++sNextRequestId)
@@ -432,6 +433,12 @@ protected:
 		this->readyState = readyState;
 		if (readyState == READYSTATE_LOADED) {
 			stopThread();
+			TVPAddLog(ttstr(L"httprequest: UI received completion; status=") + ttstr(statusCode)
+				+ L", notification failures=" + ttstr((int)notificationFailures)
+				+ L", first Win32 error=" + ttstr((int)notificationError));
+			TVPAddLog(ttstr(L"httprequest: request/headers result=") + ttstr(requestResult)
+				+ L", response body result=" + ttstr(responseResult)
+				+ L" (-1=not reached, 0=success); " + statusText);
 		}
 		tTJSVariant param(readyState);
 		static ttstr eventName(TJS_W("onReadyStateChange"));
@@ -470,14 +477,14 @@ protected:
 		case WM_HTTP_READYSTATE:
 		  {
           HttpRequest *self = findRequest((UINT_PTR)Message->WParam);
-          if (!self) return true;
+          if (!self || !self->threadHandle) return true;
           self->onReadyStateChange((ReadyState)Message->LParam);
           return true;
 		  }
 		case WM_HTTP_PROGRESS:
 		  {
           HttpRequest *self = findRequest((UINT_PTR)Message->WParam);
-          if (!self) return true;
+          if (!self || !self->threadHandle) return true;
           int lparam = (int)Message->LParam;
           self->onProgress((lparam & 0x8000)!=0, tjs_real(lparam & 0x7fff) / 100.0);
           return true;
@@ -489,6 +496,43 @@ protected:
 	static HttpRequest *findRequest(UINT_PTR requestId) {
 		std::map<UINT_PTR, HttpRequest *>::const_iterator it = sRequestMap.find(requestId);
 		return it != sRequestMap.end() ? it->second : NULL;
+	}
+
+	// A timer is synthesized by the UI message loop even when PostMessage failed
+	// because the posted-message queue was full. Never wait for the UI in a worker.
+	static void CALLBACK completionTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
+		for (auto it = sRequestMap.begin(); it != sRequestMap.end(); ++it) {
+			HttpRequest *self = it->second;
+			if (self->completionTimer != id) continue;
+			int stage = self->workerStage.load();
+			if (stage != self->loggedStage) {
+				self->loggedStage = stage;
+				TVPAddLog(ttstr(L"httprequest: worker stage=") + ttstr(stage)
+					+ L" (1=request/response headers, 2=response body, 3=finished)");
+			}
+			if (self->threadHandle && WaitForSingleObject(self->threadHandle, 0) == WAIT_OBJECT_0) {
+				TVPAddLog(L"httprequest: timer recovered completion notification");
+				self->onReadyStateChange(READYSTATE_LOADED);
+			}
+			return;
+		}
+	}
+
+	void postNotification(UINT message, LPARAM value) {
+		if (!::PostMessage(hwnd, message, (WPARAM)requestId, value)) {
+			DWORD error = GetLastError();
+			if (notificationFailures++ == 0) notificationError = error;
+			OutputDebugStringW(L"httprequest: PostMessage failed; completion timer remains active\n");
+		}
+	}
+
+	void postProgress(bool upload, DWORD size, DWORD length) {
+		DWORD now = GetTickCount();
+		if (now - lastProgressTick < 100) return;
+		lastProgressTick = now;
+		DWORDLONG bp = length ? (DWORDLONG)size * 10000 / length : 0;
+		if (bp > 10000) bp = 10000;
+		postNotification(WM_HTTP_PROGRESS, (upload ? 0x8000 : 0) | (LPARAM)bp);
 	}
 
 	// -----------------------------------------------
@@ -538,8 +582,7 @@ protected:
 		if (size > 0) {
 			inputSize += size;
 		    if (async) {
-			  int bp = (inputLength > 0) ? (DWORDLONG)inputSize * 10000 / inputLength : 0;
-			  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)requestId, 0x8000 | bp);
+			  postProgress(true, inputSize, inputLength);
 			}
 		}
 		return !canceled;
@@ -593,8 +636,7 @@ protected:
 		}
 		outputSize += size;
 	    if (async) {
-		  int bp = (outputLength > 0) ? (DWORDLONG)outputSize * 10000 / outputLength : 0;
-		  ::PostMessage(hwnd, WM_HTTP_PROGRESS, (WPARAM)requestId, bp);
+		  postProgress(false, outputSize, outputLength);
 		}
 		return !canceled;
 	}
@@ -623,20 +665,17 @@ protected:
 	 */
 	void threadMain(bool async=true) {
 
-		{
-			tTJSVariant val;
-			window->PropGet(0, TJS_W("HWND"), NULL, &val, objthis);
-			hwnd = reinterpret_cast<HWND>((tjs_int64)(val));
-		}
-
-	    if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_SENT);
+		workerStage.store(1);
+	    if (async) postNotification(WM_HTTP_READYSTATE, READYSTATE_SENT);
 		inputSize = 0;
 		int errorCode;
 		if (canceled) {
 			errorCode = HttpConnection::ERROR_CANCEL;
 			clearInput();
 		} else {
-		    if ((errorCode = http->request(async ? uploadCallback : uploadCallbackSync, rewindUploadCallback, (void*)this)) == HttpConnection::ERROR_NONE) {
+		    if ((requestResult = errorCode = http->request(async ? uploadCallback : uploadCallbackSync, rewindUploadCallback, (void*)this)) == HttpConnection::ERROR_NONE) {
+				OutputDebugStringW(L"httprequest: request and response headers completed\n");
+				workerStage.store(2);
 				clearInput();
 				if (canceled) {
 					errorCode = HttpConnection::ERROR_CANCEL;
@@ -645,8 +684,8 @@ protected:
 					http->queryInfo();
 					outputSize = 0;
 					outputLength = http->getContentLength();
-					if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_RECEIVING);
-				    if ((errorCode = http->response(async ? downloadCallback : downloadCallbackSync, (void*)this)) == HttpConnection::ERROR_NONE) {
+					if (async) postNotification(WM_HTTP_READYSTATE, READYSTATE_RECEIVING);
+				    if ((responseResult = errorCode = http->response(async ? downloadCallback : downloadCallbackSync, (void*)this)) == HttpConnection::ERROR_NONE) {
 						closeOutput();
 					} else {
 						clearOutput();
@@ -670,7 +709,9 @@ protected:
 			statusText = http->getErrorMessage();
 			break;
 		}
-		if (async) ::PostMessage(hwnd, WM_HTTP_READYSTATE, (WPARAM)requestId, (LPARAM)READYSTATE_LOADED);
+		workerStage.store(3);
+		OutputDebugStringW(L"httprequest: worker finished; posting completion\n");
+		if (async) postNotification(WM_HTTP_READYSTATE, READYSTATE_LOADED);
 	}
 
 	// 実行スレッド
@@ -683,12 +724,36 @@ protected:
 	// スレッド処理開始
 	void startThread() {
 		stopThread();
+		// Resolve the window on its owning thread, and reject stale messages from
+		// an earlier send on the same HttpRequest object.
+		tTJSVariant val;
+		window->PropGet(0, TJS_W("HWND"), NULL, &val, objthis);
+		hwnd = reinterpret_cast<HWND>((tjs_int64)(val));
+		sRequestMap.erase(requestId);
+		requestId = ++sNextRequestId;
+		sRequestMap[requestId] = this;
+		lastProgressTick = GetTickCount() - 100;
+		notificationFailures = notificationError = 0;
+		requestResult = responseResult = -1;
+		workerStage.store(0);
+		loggedStage = -1;
+		completionTimer = SetTimer(NULL, 0, 100, completionTimerProc);
+		if (!completionTimer) TVPThrowExceptionMessage(L"httprequest: completion timer creation failed");
 		canceled = false;
 		threadHandle = (HANDLE)_beginthreadex(NULL, 0, threadFunc, this, 0, NULL);
+		if (!threadHandle) {
+			KillTimer(NULL, completionTimer);
+			completionTimer = 0;
+			TVPThrowExceptionMessage(L"httprequest: worker creation failed");
+		}
 	}
 
 	// スレッド処理終了
 	void stopThread() {
+		if (completionTimer) {
+			KillTimer(NULL, completionTimer);
+			completionTimer = 0;
+		}
 		if (threadHandle) {
 			canceled = true;
 			http->abortRequest();
@@ -708,7 +773,13 @@ private:
 
 	// スレッド処理用
 	HANDLE threadHandle; ///< スレッドのハンドル
-	bool canceled; ///< キャンセルされた
+	std::atomic<bool> canceled; ///< キャンセルされた
+	UINT_PTR completionTimer;
+	DWORD lastProgressTick;
+	DWORD notificationFailures = 0, notificationError = 0;
+	std::atomic<int> workerStage{0};
+	int loggedStage = -1;
+	int requestResult = -1, responseResult = -1;
 
 	// リクエスト
 	IStream *inputStream;   ///< 送信用ストリーム
